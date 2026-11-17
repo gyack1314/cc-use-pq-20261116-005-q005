@@ -39,19 +39,26 @@ class AuditInspector:
         source_keys = sorted({entry["source"] for entry in bundle["entries"]})
         indicator_keys = sorted({entry["indicator"] for entry in bundle["entries"]})
         missing = []
+        schema = bundle["manifest"].get("schema_version", 1)
         for entry in bundle["entries"]:
             batch = self.store.batch(entry["batch_id"])
             if batch["source"] != entry["source"]:
                 missing.append({"entry": entry, "reason": "source_mismatch"})
                 continue
             rows = self.store.measurements(entry["batch_id"])
+            # Pre-region snapshots are anchored to the reserved scope; their
+            # entries lack the field, and the stored rows are unscoped.
+            region = entry["region"] if schema >= 2 else "unscoped"
             if not any(row["line"] == entry["line"] and row["indicator"] == entry["indicator"]
+                       and row["region"] == region
                        and row["period"] == entry["period"] and row["value"] == entry["value"]
                        for row in rows):
                 missing.append({"entry": entry, "reason": "measurement_mismatch"})
+        regions = sorted({entry["region"] for entry in bundle["entries"]}) if schema >= 2 else ["unscoped"]
         return {"version": version, "verified": not missing and self.releases.verify(bundle),
                 "digest": bundle["digest"], "lineage": lineage,
                 "batch_ids": batches, "sources": source_keys, "indicators": indicator_keys,
+                "regions": regions,
                 "entry_count": len(bundle["entries"]), "broken_entries": missing}
 
     def inspect_all(self) -> dict[str, Any]:

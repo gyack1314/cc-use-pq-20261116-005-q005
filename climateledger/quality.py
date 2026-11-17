@@ -16,6 +16,7 @@ class Finding:
     period: str | None
     line: int | None
     detail: str
+    region: str | None = None
 
     def document(self) -> dict[str, Any]:
         return asdict(self)
@@ -45,50 +46,57 @@ class QualityGate:
         for item in rejected:
             findings.append(Finding("block", item["code"], None, None, item["line"], item["detail"]))
         series = index_by_series(measurements)
-        seen: dict[tuple[str, str], Measurement] = {}
+        seen: dict[tuple[str, str, str], Measurement] = {}
         for item in measurements:
-            key = item.indicator, item.period
+            # Duplicate detection is scoped: the same period in two regions is
+            # two distinct observations, not a duplicate of one.
+            key = item.indicator, item.region, item.period
             previous = seen.get(key)
             if previous:
                 code = "duplicate_period" if previous.value == item.value else "conflicting_period"
                 findings.append(Finding("block", code, item.indicator, item.period, item.line,
-                                        f"period previously supplied on line {previous.line}"))
+                                        f"period previously supplied on line {previous.line} "
+                                        f"in region {item.region}", item.region))
             else:
                 seen[key] = item
             indicator = self.registry.indicator(item.indicator)
             number = Decimal(item.value)
             if not indicator.allow_negative and number < 0:
                 findings.append(Finding("block", "negative_value", item.indicator, item.period,
-                                        item.line, "negative measurement not allowed"))
+                                        item.line, "negative measurement not allowed", item.region))
             if indicator.minimum is not None and number < Decimal(indicator.minimum):
                 findings.append(Finding("block", "below_minimum", item.indicator, item.period,
-                                        item.line, f"below registered minimum {indicator.minimum}"))
+                                        item.line, f"below registered minimum {indicator.minimum}",
+                                        item.region))
             if indicator.maximum is not None and number > Decimal(indicator.maximum):
                 findings.append(Finding("block", "above_maximum", item.indicator, item.period,
-                                        item.line, f"above registered maximum {indicator.maximum}"))
-        for key, items in series.items():
+                                        item.line, f"above registered maximum {indicator.maximum}",
+                                        item.region))
+        for (key, region), items in series.items():
             indicator = self.registry.indicator(key)
             indices = sorted({period_index(item.period, indicator.cadence) for item in items})
             if indices:
                 missing = sorted(set(range(indices[0], indices[-1] + 1)) - set(indices))
                 if len(missing) > 1000:
                     findings.append(Finding("block", "coverage_span", key, None, None,
-                                            "more than 1000 missing periods"))
+                                            "more than 1000 missing periods", region))
                 else:
                     for index in missing:
                         period = period_from_index(index, indicator.cadence)
                         findings.append(Finding("review", "missing_period", key, period, None,
-                                                "gap within submitted series"))
+                                                "gap within submitted series", region))
             for item in items:
-                prior = self.store.current_measurement(source_key, key, item.period)
+                prior = self.store.current_measurement(source_key, key, item.period, region)
                 if prior is not None and prior["value"] != item.value:
                     findings.append(Finding("review", "revised_value", key, item.period, item.line,
-                                            f"published value {prior['value']} differs"))
+                                            f"published value {prior['value']} differs in region {region}",
+                                            region))
         if not measurements:
             findings.append(Finding("block", "empty_batch", None, None, None, "no accepted measurements"))
         status = "rejected" if any(item.severity == "block" for item in findings) else (
             "review" if findings else "accepted")
-        findings.sort(key=lambda item: (item.severity, item.code, item.indicator or "", item.period or "", item.line or 0))
+        findings.sort(key=lambda item: (item.severity, item.code, item.indicator or "",
+                                        item.region or "", item.period or "", item.line or 0))
         return Assessment(status, len(measurements), len(rejected), tuple(findings))
 
     def reviewable(self, assessment: Assessment) -> list[Finding]:

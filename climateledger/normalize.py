@@ -6,7 +6,8 @@ from decimal import Decimal, ROUND_HALF_EVEN, InvalidOperation
 from typing import Any
 import re
 
-from .registry import ContractError, Registry, Source, precise
+from .registry import (ContractError, LEGACY_REGION, Registry, Source, explicit_region,
+                       precise)
 
 
 MONTH = re.compile(r"^(\d{4})-(0[1-9]|1[0-2])$")
@@ -25,6 +26,7 @@ class Measurement:
     line: int
     rule_factor: str
     rule_offset: str
+    region: str = LEGACY_REGION
 
     def document(self) -> dict[str, Any]:
         return asdict(self)
@@ -71,10 +73,18 @@ class Normalizer:
     def __init__(self, registry: Registry):
         self.registry = registry
 
-    def measurement(self, source: Source, row: dict[str, Any]) -> Measurement:
+    def measurement(self, source: Source, row: dict[str, Any], default_region: str | None = None) -> Measurement:
         key = row.get("indicator")
         indicator = self.registry.indicator(key)
-        self.registry.require_scope(source, indicator)
+        if "region" in row:
+            # An explicit region (row column or manifest default) must name a
+            # real region; the reserved legacy scope is never explicit.
+            region = explicit_region(row.get("region"), "row region")
+        elif default_region is not None:
+            region = default_region
+        else:
+            raise ContractError("region_missing", "row has no region")
+        self.registry.require_scope(source, indicator, region)
         period = normalize_period(row.get("period"), indicator.cadence)
         raw_unit = row.get("unit")
         if not isinstance(raw_unit, str) or not raw_unit.strip():
@@ -87,23 +97,25 @@ class Normalizer:
         if type(line) is not int or line < 1:
             raise ContractError("line_number", "line must be a positive integer")
         return Measurement(source.key, indicator.key, period, value, indicator.canonical_unit,
-                           str(raw), raw_unit, line, rule.factor, rule.offset)
+                           str(raw), raw_unit, line, rule.factor, rule.offset, region)
 
-    def batch(self, source: Source, rows: tuple[dict[str, Any], ...]) -> tuple[list[Measurement], list[dict[str, Any]]]:
+    def batch(self, source: Source, rows: tuple[dict[str, Any], ...],
+              default_region: str | None = LEGACY_REGION) -> tuple[list[Measurement], list[dict[str, Any]]]:
         accepted = []
         rejected = []
         for row in rows:
             try:
-                accepted.append(self.measurement(source, row))
+                accepted.append(self.measurement(source, row, default_region))
             except ContractError as exc:
                 rejected.append({"line": row.get("line"), "code": exc.code, "detail": exc.detail})
         return accepted, rejected
 
 
-def index_by_series(measurements: list[Measurement]) -> dict[str, list[Measurement]]:
-    series: dict[str, list[Measurement]] = {}
+def index_by_series(measurements: list[Measurement]) -> dict[tuple[str, str], list[Measurement]]:
+    """Group by indicator and region: one region's series never masks another's."""
+    series: dict[tuple[str, str], list[Measurement]] = {}
     for item in measurements:
-        series.setdefault(item.indicator, []).append(item)
+        series.setdefault((item.indicator, item.region), []).append(item)
     for values in series.values():
         values.sort(key=lambda item: item.period)
     return series

@@ -44,6 +44,7 @@ def parser() -> ArgumentParser:
     series.add_argument("indicator")
     series.add_argument("--version", type=int)
     series.add_argument("--source")
+    series.add_argument("--region")
     events = commands.add_parser("events")
     events.add_argument("--subject")
     commands.add_parser("status")
@@ -56,16 +57,19 @@ def parser() -> ArgumentParser:
     stats.add_argument("indicator")
     stats.add_argument("version", type=int)
     stats.add_argument("--source")
+    stats.add_argument("--region")
     commands.add_parser("audit")
     coverage = commands.add_parser("coverage")
     coverage.add_argument("version", type=int)
     coverage.add_argument("--indicator")
     coverage.add_argument("--source")
+    coverage.add_argument("--region")
     batch_coverage = commands.add_parser("batch-coverage")
     batch_coverage.add_argument("batch", type=int)
     discrepancies = commands.add_parser("discrepancies")
     discrepancies.add_argument("version", type=int)
     discrepancies.add_argument("indicator")
+    discrepancies.add_argument("--region")
     replay = commands.add_parser("replay")
     replay.add_argument("manifest")
     replay.add_argument("batch", type=int)
@@ -109,6 +113,15 @@ def demo(workspace: str) -> dict[str, Any]:
         service.register_source({"key": "sample_lab", "title": "Synthetic local lab",
                                  "license": "Local synthetic fixture", "allowed_indicators": ["co2_ppm"]})
         service.register_unit({"indicator": "co2_ppm", "source_unit": "ppb", "factor": "0.001"})
+        service.register_source({"key": "national_lab", "title": "Synthetic national service",
+                                 "license": "Local synthetic fixture", "allowed_indicators": ["co2_ppm"],
+                                 "allowed_regions": ["national"]})
+        service.register_source({"key": "province_lab", "title": "Synthetic provincial service",
+                                 "license": "Local synthetic fixture", "allowed_indicators": ["co2_ppm"],
+                                 "allowed_regions": ["province_anhui", "coastal_east"]})
+        service.register_source({"key": "legacy_lab", "title": "Synthetic pre-region archive",
+                                 "license": "Local synthetic fixture", "allowed_indicators": ["co2_ppm"]})
+
         rows = [{"indicator": "co2_ppm", "period": "2026-01", "value": "428000", "unit": "ppb"},
                 {"indicator": "co2_ppm", "period": "2026-02", "value": "429000", "unit": "ppb"}]
         manifest = write_manifest(root, source="sample_lab", batch_id="demo_batch", rows=rows)
@@ -116,13 +129,122 @@ def demo(workspace: str) -> dict[str, Any]:
         batch = ingested["batch"]
         if batch["status"] not in {"accepted", "published"}:
             raise ContractError("demo_quality", "synthetic batch did not pass quality gate")
-        release = service.publish(batch["id"], batch["revision"])
-        bundle = service.export(release["version"])
+        first_release = _publish_when_ready(service, batch)
+        bundle = service.export(first_release["version"])
         if not service.verify(bundle) or len(bundle["entries"]) != 2:
             raise ContractError("demo_verify", "export could not be verified")
+        drill = region_drill(service, root)
         return {"batch_id": batch["id"], "idempotent": ingested["idempotent"],
-                "release_version": release["version"], "digest": release["digest"],
-                "entries": len(bundle["entries"]), "verified": True}
+                "release_version": first_release["version"], "digest": first_release["digest"],
+                "entries": len(bundle["entries"]), "verified": True,
+                "region_drill": drill}
+
+
+def _publish_when_ready(service: LedgerService, batch: dict[str, Any]) -> dict[str, Any]:
+    if batch["status"] == "review":
+        service.approve(batch["id"], batch["revision"])
+    return service.publish(batch["id"], batch["revision"])
+
+
+def region_drill(service: LedgerService, root: Path) -> dict[str, Any]:
+    """Offline drill: concurrent regions, a regional correction, and legacy scope."""
+    periods = ("2026-01", "2026-02", "2026-03")
+    national = write_manifest(root / "drill" / "national", source="national_lab",
+                              batch_id="drill_national",
+                              rows=[{"indicator": "co2_ppm", "period": period,
+                                     "value": value, "unit": "ppm"}
+                                    for period, value in zip(periods, (420, 421, 422))],
+                              region="national")
+    province_values = {"province_anhui": (415, 416, 417), "coastal_east": (430, 431, 432)}
+    province = write_manifest(
+        root / "drill" / "province", source="province_lab", batch_id="drill_province",
+        rows=[{"indicator": "co2_ppm", "period": period, "value": value, "unit": "ppm",
+               "region": region}
+              for region, values in province_values.items()
+              for period, value in zip(periods, values)])
+    legacy = write_manifest(root / "drill" / "legacy", source="legacy_lab",
+                            batch_id="drill_legacy",
+                            rows=[{"indicator": "co2_ppm", "period": period,
+                                   "value": value, "unit": "ppm"}
+                                  for period, value in zip(periods, (410, 411, 412))])
+    # Publish in a fixed order so repeated runs reuse the same versions and the
+    # correction compares against exactly the release that preceded it.
+    bundles = []
+    batches = []
+    for manifest in (national, legacy, province):
+        ingested = service.ingest(manifest)["batch"]
+        if ingested["status"] not in {"accepted", "published"}:
+            raise ContractError("demo_quality", f"drill batch {ingested['id']} needs review")
+        batches.append(ingested)
+        bundles.append(_publish_when_ready(service, ingested))
+    legacy_batch, legacy_release = batches[1], bundles[1]["version"]
+    region_release = bundles[2]["version"]
+
+    # A correction for one province only. The other regions keep their values.
+    corrected = write_manifest(
+        root / "drill" / "province_fix", source="province_lab", batch_id="drill_province_fix",
+        rows=[{"indicator": "co2_ppm", "period": period, "value": value, "unit": "ppm",
+               "region": region}
+              for region, values in {"province_anhui": (415, 419, 417),
+                                     "coastal_east": (430, 431, 432)}.items()
+              for period, value in zip(periods, values)])
+    correction_batch = service.ingest(corrected)["batch"]
+    correction = _publish_when_ready(service, correction_batch)
+    diff = service.compare(region_release, correction["version"])
+    if ([change["region"] for change in diff["changes"] if change["change"] != "reaffirmed"]
+            != ["province_anhui"]):
+        raise ContractError("demo_region", "correction leaked outside its region")
+    if not service.verify(service.export(correction["version"])):
+        raise ContractError("demo_verify", "corrected snapshot could not be verified")
+
+    # Legacy file: stored in the reserved scope, never inferred as national.
+    legacy_entries = [row for row in service.export(legacy_release)["entries"]
+                      if row["source"] == "legacy_lab"]
+    if {row["region"] for row in legacy_entries} != {"unscoped"}:
+        raise ContractError("demo_region", "legacy file was mapped to an inferred region")
+    if service.statistics("co2_ppm", correction["version"], region="national")["count"] != 3:
+        raise ContractError("demo_region", "national query mixed in another region")
+
+    # Unauthorized region is refused instead of being relabelled or dropped.
+    probe = write_manifest(root / "drill" / "probe", source="national_lab",
+                           batch_id="drill_probe",
+                           rows=[{"indicator": "co2_ppm", "period": "2026-01",
+                                  "value": "400", "unit": "ppm"}],
+                           region="province_anhui")
+    unauthorized = False
+    try:
+        service.ingest(probe)
+    except ContractError as exc:
+        unauthorized = exc.code == "region_scope_violation"
+    if not unauthorized:
+        raise ContractError("demo_region", "unauthorized region was not rejected")
+
+    snapshot = [row for row in service.export(correction["version"])["entries"]
+                if row["period"] == "2026-01"]
+    return {"same_month_regions": {
+                "period": "2026-01",
+                "entries": sorted(({"source": row["source"], "region": row["region"],
+                                    "value": row["value"]} for row in snapshot),
+                                  key=lambda item: (item["region"], item["source"]))},
+            "regions": sorted({row["region"] for row in
+                               service.export(correction["version"])["entries"]}),
+            "correction": {"batch": correction_batch["id"],
+                           "revision": correction_batch["revision"],
+                           "from_version": region_release,
+                           "to_version": correction["version"],
+                           "changes": diff["changes"],
+                           "by_region": diff["summary"]["by_region"]},
+            "legacy": {"region": "unscoped",
+                       "origin": legacy_batch["region_origin"],
+                       "explanation": "files without a region are stored in reserved region "
+                                      "unscoped and never inferred as a province or country",
+                       "values": {row["period"]: row["value"] for row in legacy_entries}},
+            "queries": {"national": service.statistics("co2_ppm", correction["version"],
+                                                       region="national"),
+                        "province_anhui": service.statistics("co2_ppm", correction["version"],
+                                                             region="province_anhui")},
+            "authorization": {"source": "national_lab", "attempted_region": "province_anhui",
+                              "rejected": unauthorized}}
 
 
 def execute(args: Namespace) -> Any:
@@ -159,7 +281,7 @@ def execute(args: Namespace) -> Any:
         if args.command == "lineage":
             return service.lineage(args.version)
         if args.command == "series":
-            return service.series(args.indicator, args.version, args.source)
+            return service.series(args.indicator, args.version, args.source, args.region)
         if args.command == "events":
             return service.events(args.subject)
         if args.command == "status":
@@ -169,15 +291,15 @@ def execute(args: Namespace) -> Any:
         if args.command == "impact":
             return service.impact(args.batch)
         if args.command == "statistics":
-            return service.statistics(args.indicator, args.version, args.source)
+            return service.statistics(args.indicator, args.version, args.source, args.region)
         if args.command == "audit":
             return service.audit_all()
         if args.command == "coverage":
-            return service.coverage(args.version, args.indicator, args.source)
+            return service.coverage(args.version, args.indicator, args.source, args.region)
         if args.command == "batch-coverage":
             return service.batch_coverage_report(args.batch)
         if args.command == "discrepancies":
-            return service.discrepancies(args.version, args.indicator)
+            return service.discrepancies(args.version, args.indicator, args.region)
         if args.command == "replay":
             return service.replay(args.manifest, args.batch)
         if args.command == "pending-review":

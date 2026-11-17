@@ -8,7 +8,12 @@ from typing import Any
 import csv
 import json
 
-from .registry import ContractError, identifier
+from .registry import ContractError, LEGACY_REGION, explicit_region, identifier
+
+
+REGION_ORIGIN_MANIFEST = "manifest"
+REGION_ORIGIN_ROWS = "rows"
+REGION_ORIGIN_LEGACY = "legacy_default"
 
 
 @dataclass(frozen=True)
@@ -20,6 +25,21 @@ class BatchEnvelope:
     payload_hash: str
     declared_count: int
     metadata: dict[str, Any]
+    region: str | None = None
+    region_default: str = LEGACY_REGION
+    region_origin: str = REGION_ORIGIN_LEGACY
+
+    def region_interpretation(self) -> dict[str, Any]:
+        """Deterministic, replayable account of how rows obtained a region."""
+        if self.region_origin == REGION_ORIGIN_MANIFEST:
+            explanation = f"all rows use manifest region {self.region}"
+        elif self.region_origin == REGION_ORIGIN_ROWS:
+            explanation = "each row carries an explicit region column"
+        else:
+            explanation = (f"no region declared; rows are stored in reserved region "
+                           f"{LEGACY_REGION}, never inferred as a province or country")
+        return {"origin": self.region_origin, "batch_region": self.region,
+                "row_default": self.region_default, "explanation": explanation}
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -50,9 +70,10 @@ def manifest_value(path: Path) -> dict[str, Any]:
 
 
 def valid_mapping(mapping: Any) -> dict[str, str]:
-    required = ("indicator", "period", "value", "unit")
-    if not isinstance(mapping, dict) or set(mapping) != set(required):
-        raise ContractError("column_mapping", "columns must map indicator, period, value and unit")
+    required = frozenset(("indicator", "period", "value", "unit"))
+    if not isinstance(mapping, dict) or not required <= set(mapping) <= required | {"region"}:
+        raise ContractError("column_mapping", "columns must map indicator, period, value and unit, "
+                                              "with optional region")
     for key, column in mapping.items():
         if not isinstance(column, str) or not column.strip():
             raise ContractError("column_mapping", f"empty mapping for {key}")
@@ -112,6 +133,16 @@ def load_batch(manifest_path: str | Path) -> BatchEnvelope:
     metadata = manifest.get("metadata", {})
     if not isinstance(metadata, dict) or len(canonical_bytes(metadata)) > 8192:
         raise ContractError("metadata", "metadata must be a small object")
+    raw_region = manifest.get("region")
+    region = explicit_region(raw_region, "manifest region") if raw_region is not None else LEGACY_REGION
+    if "region" in mapping and raw_region is not None:
+        raise ContractError("region_conflict", "manifest region cannot be combined with a region column")
+    if "region" in mapping:
+        origin = REGION_ORIGIN_ROWS
+    elif raw_region is not None:
+        origin = REGION_ORIGIN_MANIFEST
+    else:
+        origin = REGION_ORIGIN_LEGACY
     payload = file_bytes(path.parent / filename)
     digest = sha256(payload).hexdigest()
     expected_hash = manifest.get("sha256")
@@ -125,14 +156,21 @@ def load_batch(manifest_path: str | Path) -> BatchEnvelope:
         if any(column not in row for column in mapping.values()):
             raise ContractError("missing_column", f"row {number} missing mapped column")
         normalized = {key: row[column] for key, column in mapping.items()}
+        if origin == REGION_ORIGIN_MANIFEST:
+            normalized["region"] = region
+        # When region comes from a column it is validated per row by the
+        # normalizer, so a bad cell is one rejected row rather than a lost batch.
         normalized["line"] = number
         rows.append(normalized)
-    return BatchEnvelope(source, batch_id, format_name, tuple(rows), digest, declared_count, metadata)
+    return BatchEnvelope(source, batch_id, format_name, tuple(rows), digest, declared_count,
+                         metadata, region if origin == REGION_ORIGIN_MANIFEST else None,
+                         region, origin)
 
 
 def write_manifest(directory: str | Path, *, source: str, batch_id: str,
                    rows: list[dict[str, Any]], format_name: str = "json",
-                   metadata: dict[str, Any] | None = None) -> Path:
+                   metadata: dict[str, Any] | None = None,
+                   region: str | None = None) -> Path:
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     identifier(source, "source")
@@ -141,20 +179,31 @@ def write_manifest(directory: str | Path, *, source: str, batch_id: str,
         raise ContractError("payload_format", "format must be csv or json")
     if not rows:
         raise ContractError("empty_rows", "at least one row is required")
+    columns = ["indicator", "period", "value", "unit"]
+    if any("region" in row for row in rows):
+        if region is not None:
+            raise ContractError("region_conflict", "manifest region cannot be combined with a region column")
+        columns.append("region")
+        region = None
+    else:
+        region = explicit_region(region, "manifest region") if region is not None else None
     filename = f"{batch_id}.{format_name}"
     payload_path = root / filename
     if format_name == "json":
         payload = canonical_bytes(rows)
     else:
         stream = StringIO(newline="")
-        writer = csv.DictWriter(stream, fieldnames=["indicator", "period", "value", "unit"], lineterminator="\n")
+        writer = csv.DictWriter(stream, fieldnames=columns,
+                                extrasaction="ignore", lineterminator="\n")
         writer.writeheader()
         writer.writerows(rows)
         payload = stream.getvalue().encode("utf-8")
     payload_path.write_bytes(payload)
     manifest = {"source": source, "batch_id": batch_id, "format": format_name,
-                "payload": filename, "columns": {key: key for key in ("indicator", "period", "value", "unit")},
+                "payload": filename, "columns": {key: key for key in columns},
                 "row_count": len(rows), "sha256": sha256(payload).hexdigest(), "metadata": metadata or {}}
+    if region is not None:
+        manifest["region"] = region
     manifest_path = root / f"{batch_id}.manifest.json"
     manifest_path.write_bytes(canonical_bytes(manifest))
     return manifest_path

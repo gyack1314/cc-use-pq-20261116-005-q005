@@ -3,10 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .intake import load_batch
+from .intake import REGION_ORIGIN_ROWS, load_batch
 from .normalize import Normalizer
 from .quality import QualityGate
-from .registry import ContractError, Registry
+from .registry import ContractError, Registry, region_identifier
 from .release import ReleaseBuilder
 from .store import LedgerStore
 from .compare import Comparator, SeriesWindow
@@ -63,7 +63,14 @@ class LedgerService:
         source = self.registry.source(envelope.source)
         if not source.active:
             raise ContractError("inactive_source", f"source {source.key} is inactive")
-        measurements, rejected = self.normalizer.batch(source, envelope.rows)
+        if envelope.region_origin != REGION_ORIGIN_ROWS:
+            # Rows carry their own regions, checked per row by the normalizer;
+            # only a manifest-wide default needs the batch-level authority check.
+            self.registry.require_manifest_scope(source, envelope.region_default)
+        # A row-scoped file must carry a region on every row; only manifest
+        # and legacy files have a batch-level default to fall back on.
+        fallback = None if envelope.region_origin == REGION_ORIGIN_ROWS else envelope.region_default
+        measurements, rejected = self.normalizer.batch(source, envelope.rows, fallback)
         assessment = self.quality.assess(source.key, measurements, rejected)
         batch = self.store.insert_batch(envelope, assessment, measurements)
         return {"batch": batch, "idempotent": False}
@@ -95,8 +102,10 @@ class LedgerService:
         return self.store.list_batches(status)
 
     def series(self, indicator: str, version: int | None = None,
-               source: str | None = None) -> list[dict[str, Any]]:
+               source: str | None = None, region: str | None = None) -> list[dict[str, Any]]:
         self.registry.indicator(indicator)
+        if region is not None:
+            region_identifier(region, "region")
         if version is None:
             latest = self.store.latest_release()
             if latest is None:
@@ -104,7 +113,9 @@ class LedgerService:
             version = latest["version"]
         entries = self.store.release_entries(version)
         return [item for item in entries if item["indicator"] == indicator and
-                (source is None or item["source"] == source)]
+                (source is None or item["source"] == source) and
+                # No implicit fallback: asking for a region returns that region only.
+                (region is None or item["region"] == region)]
 
     def events(self, subject: str | None = None) -> list[dict[str, Any]]:
         return self.store.events(subject)
@@ -115,21 +126,22 @@ class LedgerService:
     def impact(self, batch_id: int) -> dict[str, Any]:
         return self.comparator.batch_impact(batch_id)
 
-    def statistics(self, indicator: str, version: int, source: str | None = None) -> dict[str, Any]:
-        return self.windows.statistics(indicator, version, source=source)
+    def statistics(self, indicator: str, version: int, source: str | None = None,
+                   region: str | None = None) -> dict[str, Any]:
+        return self.windows.statistics(indicator, version, source=source, region=region)
 
     def audit_all(self) -> dict[str, Any]:
         return self.audit.inspect_all()
 
     def coverage(self, version: int, indicator: str | None = None,
-                 source: str | None = None) -> dict[str, Any]:
-        return self.coverage_reporter.report(version, indicator, source)
+                 source: str | None = None, region: str | None = None) -> dict[str, Any]:
+        return self.coverage_reporter.report(version, indicator, source, region)
 
     def batch_coverage_report(self, batch_id: int) -> dict[str, Any]:
         return self.batch_coverage.report(batch_id)
 
-    def discrepancies(self, version: int, indicator: str) -> dict[str, Any]:
-        return self.coverage_reporter.discrepancy_report(version, indicator)
+    def discrepancies(self, version: int, indicator: str, region: str | None = None) -> dict[str, Any]:
+        return self.coverage_reporter.discrepancy_report(version, indicator, region=region)
 
     def replay(self, manifest_path: str | Path, batch_id: int) -> dict[str, Any]:
         return self.replay_inspector.compare_manifest(manifest_path, batch_id)

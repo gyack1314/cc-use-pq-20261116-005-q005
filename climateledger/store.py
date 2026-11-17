@@ -12,6 +12,9 @@ from .registry import ContractError, UnitRule
 from .intake import canonical_bytes
 
 
+REGION_MIXED = "mixed"
+
+
 SCHEMA = """
 PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS indicators (key TEXT PRIMARY KEY, contract TEXT NOT NULL);
@@ -24,21 +27,25 @@ CREATE TABLE IF NOT EXISTS batches (
     payload_hash TEXT NOT NULL, status TEXT NOT NULL, row_count INTEGER NOT NULL,
     metadata TEXT NOT NULL, findings TEXT NOT NULL, received_at TEXT NOT NULL,
     approved_at TEXT, published_version INTEGER,
+    region TEXT NOT NULL DEFAULT 'unscoped', region_origin TEXT NOT NULL DEFAULT 'legacy_default',
+    region_detail TEXT NOT NULL DEFAULT '{}',
     UNIQUE(source, external_id, revision), FOREIGN KEY(source) REFERENCES sources(key));
 CREATE INDEX IF NOT EXISTS batches_lookup ON batches(source, external_id, revision DESC);
 CREATE TABLE IF NOT EXISTS measurements (
     batch_id INTEGER NOT NULL, line INTEGER NOT NULL, indicator TEXT NOT NULL, period TEXT NOT NULL,
     value TEXT NOT NULL, unit TEXT NOT NULL, raw_value TEXT NOT NULL, raw_unit TEXT NOT NULL,
-    factor TEXT NOT NULL, offset TEXT NOT NULL,
+    factor TEXT NOT NULL, offset TEXT NOT NULL, region TEXT NOT NULL DEFAULT 'unscoped',
     PRIMARY KEY(batch_id, line), FOREIGN KEY(batch_id) REFERENCES batches(id),
     FOREIGN KEY(indicator) REFERENCES indicators(key));
-CREATE INDEX IF NOT EXISTS measurements_series ON measurements(indicator, period);
+-- measurements_series is created after migration, once region exists on old ledgers.
 CREATE TABLE IF NOT EXISTS releases (
     version INTEGER PRIMARY KEY, created_at TEXT NOT NULL, manifest TEXT NOT NULL, digest TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS release_entries (
     version INTEGER NOT NULL, source TEXT NOT NULL, indicator TEXT NOT NULL, period TEXT NOT NULL,
     batch_id INTEGER NOT NULL, line INTEGER NOT NULL, value TEXT NOT NULL, unit TEXT NOT NULL,
-    PRIMARY KEY(version, source, indicator, period), FOREIGN KEY(version) REFERENCES releases(version));
+    region TEXT NOT NULL DEFAULT 'unscoped',
+    PRIMARY KEY(version, source, indicator, region, period),
+    FOREIGN KEY(version) REFERENCES releases(version));
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, subject TEXT NOT NULL, detail TEXT NOT NULL);
 """
@@ -58,6 +65,54 @@ class LedgerStore:
         self.connection.execute("PRAGMA busy_timeout=20000")
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.executescript(SCHEMA)
+        self._migrate_region_columns()
+
+    def _migrate_region_columns(self) -> None:
+        """Old ledgers gain region columns; existing rows get the reserved scope.
+
+        CREATE TABLE IF NOT EXISTS does not alter databases created before
+        regions existed. The backfill below is the one deterministic reading:
+        unscoped, never a guessed province.
+        """
+        additions = {
+            "batches": (("region", "TEXT NOT NULL DEFAULT 'unscoped'"),
+                        ("region_origin", "TEXT NOT NULL DEFAULT 'legacy_default'"),
+                        ("region_detail", "TEXT NOT NULL DEFAULT '{}'")),
+            "measurements": (("region", "TEXT NOT NULL DEFAULT 'unscoped'"),),
+        }
+        migrated = False
+        with self.transaction():
+            for table, columns in additions.items():
+                existing = {row["name"] for row in
+                            self.connection.execute(f"PRAGMA table_info({table})")}
+                for name, definition in columns:
+                    if name not in existing:
+                        self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                        migrated = True
+            entries = {row["name"] for row in
+                       self.connection.execute("PRAGMA table_info(release_entries)")}
+            if "region" not in entries:
+                # The release primary key gains region, so the table is rebuilt.
+                self.connection.execute("ALTER TABLE release_entries RENAME TO release_entries_legacy")
+                self.connection.execute(
+                    "CREATE TABLE release_entries ("
+                    "version INTEGER NOT NULL, source TEXT NOT NULL, indicator TEXT NOT NULL, "
+                    "period TEXT NOT NULL, batch_id INTEGER NOT NULL, line INTEGER NOT NULL, "
+                    "value TEXT NOT NULL, unit TEXT NOT NULL, "
+                    "region TEXT NOT NULL DEFAULT 'unscoped', "
+                    "PRIMARY KEY(version, source, indicator, region, period), "
+                    "FOREIGN KEY(version) REFERENCES releases(version))")
+                self.connection.execute(
+                    "INSERT INTO release_entries(version,source,indicator,period,batch_id,line,value,unit) "
+                    "SELECT version,source,indicator,period,batch_id,line,value,unit "
+                    "FROM release_entries_legacy")
+                self.connection.execute("DROP TABLE release_entries_legacy")
+                migrated = True
+            if migrated:
+                self.connection.execute("DROP INDEX IF EXISTS measurements_series")
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS measurements_series "
+                "ON measurements(indicator, region, period)")
 
     def close(self) -> None:
         self.connection.close()
@@ -144,6 +199,7 @@ class LedgerStore:
         result = dict(row)
         result["metadata"] = json.loads(result["metadata"])
         result["findings"] = json.loads(result["findings"])
+        result["region_detail"] = json.loads(result["region_detail"])
         return result
 
     def list_batches(self, status: str | None = None) -> list[dict[str, Any]]:
@@ -159,21 +215,36 @@ class LedgerStore:
             if old and old["payload_hash"] == envelope.payload_hash:
                 return old
             revision = 1 if old is None else old["revision"] + 1
+            interpretation = envelope.region_interpretation()
+            measured_regions = sorted({item.region for item in measurements})
+            if interpretation["origin"] == "manifest":
+                batch_region = interpretation["batch_region"]
+            elif interpretation["origin"] == "rows":
+                # A row-scoped batch names its single region or, honestly, mixed;
+                # it must not claim the reserved legacy scope.
+                batch_region = measured_regions[0] if len(measured_regions) == 1 else REGION_MIXED
+            else:
+                batch_region = interpretation["row_default"]
             cursor = self.connection.execute(
-                "INSERT INTO batches(source,external_id,revision,payload_hash,status,row_count,metadata,findings,received_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO batches(source,external_id,revision,payload_hash,status,row_count,metadata,"
+                "findings,received_at,region,region_origin,region_detail) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (envelope.source, envelope.batch_id, revision, envelope.payload_hash,
                  assessment.status, envelope.declared_count,
                  canonical_bytes(envelope.metadata).decode(),
-                 canonical_bytes([item.document() for item in assessment.findings]).decode(), utc_now()))
+                 canonical_bytes([item.document() for item in assessment.findings]).decode(), utc_now(),
+                 batch_region,
+                 interpretation["origin"], canonical_bytes(interpretation).decode()))
             batch_id = cursor.lastrowid
             self.connection.executemany(
-                "INSERT INTO measurements VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO measurements VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 [(batch_id, item.line, item.indicator, item.period, item.value, item.unit,
-                  item.raw_value, item.raw_unit, item.rule_factor, item.rule_offset)
+                  item.raw_value, item.raw_unit, item.rule_factor, item.rule_offset, item.region)
                  for item in measurements])
             self.event("ingest", f"batch:{batch_id}", {"status": assessment.status,
-                       "revision": revision, "payload_hash": envelope.payload_hash})
+                       "revision": revision, "payload_hash": envelope.payload_hash,
+                       "region_origin": interpretation["origin"],
+                       "region_detail": interpretation})
             return self.batch(batch_id)
 
     def approve(self, batch_id: int, expected_revision: int) -> dict[str, Any]:
@@ -195,11 +266,13 @@ class LedgerStore:
         return [dict(row) for row in self.connection.execute(
             "SELECT * FROM measurements WHERE batch_id=? ORDER BY line", (batch_id,))]
 
-    def current_measurement(self, source: str, indicator: str, period: str) -> dict[str, Any] | None:
+    def current_measurement(self, source: str, indicator: str, period: str,
+                            region: str = "unscoped") -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT e.* FROM release_entries e JOIN releases r ON r.version=e.version "
-            "WHERE e.source=? AND e.indicator=? AND e.period=? ORDER BY e.version DESC LIMIT 1",
-            (source, indicator, period)).fetchone()
+            "WHERE e.source=? AND e.indicator=? AND e.region=? AND e.period=? "
+            "ORDER BY e.version DESC LIMIT 1",
+            (source, indicator, region, period)).fetchone()
         return dict(row) if row else None
 
     def latest_release(self) -> dict[str, Any] | None:
@@ -219,7 +292,8 @@ class LedgerStore:
 
     def release_entries(self, version: int) -> list[dict[str, Any]]:
         return [dict(row) for row in self.connection.execute(
-            "SELECT * FROM release_entries WHERE version=? ORDER BY source,indicator,period", (version,))]
+            "SELECT * FROM release_entries WHERE version=? ORDER BY source,indicator,region,period",
+            (version,))]
 
     def publish(self, batch_id: int, expected_revision: int, manifest: dict[str, Any],
                 entries: list[dict[str, Any]], digest: str) -> dict[str, Any]:
@@ -238,9 +312,10 @@ class LedgerStore:
                 raise ContractError("release_race", "release version changed while preparing")
             self.connection.execute("INSERT INTO releases VALUES(?,?,?,?)",
                                     (version, utc_now(), canonical_bytes(manifest).decode(), digest))
-            self.connection.executemany("INSERT INTO release_entries VALUES(?,?,?,?,?,?,?,?)",
+            self.connection.executemany("INSERT INTO release_entries VALUES(?,?,?,?,?,?,?,?,?)",
                 [(version, item["source"], item["indicator"], item["period"],
-                  item["batch_id"], item["line"], item["value"], item["unit"]) for item in entries])
+                  item["batch_id"], item["line"], item["value"], item["unit"],
+                  item["region"]) for item in entries])
             self.connection.execute("UPDATE batches SET status='published',published_version=? WHERE id=?",
                                     (version, batch_id))
             self.event("publish", f"batch:{batch_id}", {"version": version, "digest": digest})

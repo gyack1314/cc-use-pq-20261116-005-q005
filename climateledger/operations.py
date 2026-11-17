@@ -81,8 +81,10 @@ class ReceiptCatalog:
         current = [row for row in entries if row["source"] == source_key]
         return {"source": source.key, "title": source.title, "license": source.license,
                 "active": source.active, "allowed_indicators": list(source.allowed_indicators),
+                "allowed_regions": list(source.allowed_regions) if source.allowed_regions else None,
                 "batch_count": len(batches), "current_measurements": len(current),
                 "published_batch_ids": sorted({row["batch_id"] for row in current}),
+                "regions": sorted({row["region"] for row in current}),
                 "latest_release": latest["version"] if latest else None}
 
     def indicator_summary(self, indicator_key: str) -> dict[str, Any]:
@@ -94,6 +96,9 @@ class ReceiptCatalog:
                 "canonical_unit": indicator.canonical_unit, "cadence": indicator.cadence,
                 "source_count": len({row["source"] for row in current}),
                 "measurement_count": len(current),
+                "regions": sorted({row["region"] for row in current}),
+                "by_region": {region: sum(row["region"] == region for row in current)
+                              for region in sorted({row["region"] for row in current})},
                 "first_period": min((row["period"] for row in current), default=None),
                 "last_period": max((row["period"] for row in current), default=None),
                 "latest_release": latest["version"] if latest else None}
@@ -104,6 +109,7 @@ class ReceiptCatalog:
                 "external_id": batch["external_id"], "revision": batch["revision"],
                 "payload_hash": batch["payload_hash"], "received_at": batch["received_at"],
                 "status": batch["status"], "row_count": batch["row_count"],
+                "region": batch["region"], "region_origin": batch["region_origin"],
                 "accepted_rows": len(self.store.measurements(batch_id)),
                 "published_version": batch["published_version"]}
 

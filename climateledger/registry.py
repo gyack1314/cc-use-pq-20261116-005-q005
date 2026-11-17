@@ -15,12 +15,39 @@ class ContractError(ValueError):
 
 
 IDENTIFIER = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
+# Reserved region for files that predate region scoping. It is deliberately not
+# aliased to a province or country: a missing region is its own explicit scope.
+LEGACY_REGION = "unscoped"
 
 
 def identifier(value: Any, label: str) -> str:
     if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
         raise ContractError("invalid_identifier", f"{label} must be a lower-case identifier")
     return value
+
+
+def region_identifier(value: Any, label: str = "region") -> str:
+    if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
+        raise ContractError("invalid_region", f"{label} must be a lower-case region identifier")
+    return value
+
+
+def explicit_region(value: Any, label: str = "region") -> str:
+    region = region_identifier(value, label)
+    if region == LEGACY_REGION:
+        raise ContractError("reserved_region", f"{label} cannot use reserved region {LEGACY_REGION}")
+    return region
+
+
+def region_list(value: Any, label: str) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise ContractError("region_scope", f"{label} must be a nonempty list of regions")
+    regions = tuple(explicit_region(item, label) for item in value)
+    if len(set(regions)) != len(regions):
+        raise ContractError("region_scope", f"{label} contains a duplicate region")
+    return regions
 
 
 def precise(value: Any, label: str) -> Decimal:
@@ -86,6 +113,7 @@ class Source:
     license: str
     allowed_indicators: tuple[str, ...]
     active: bool
+    allowed_regions: tuple[str, ...] | None = None
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "Source":
@@ -104,13 +132,19 @@ class Source:
         keys = tuple(identifier(item, "allowed indicator") for item in allowed)
         if len(set(keys)) != len(keys):
             raise ContractError("source_scope", "duplicate allowed indicator")
+        # Omitted allowed_regions means unrestricted (which also admits legacy
+        # unscoped files); an explicit list licenses only the named regions.
+        regions = region_list(value.get("allowed_regions"), "allowed_regions")
         active = value.get("active", True)
         if type(active) is not bool:
             raise ContractError("source_active", "active must be boolean")
-        return cls(key, title.strip(), license_text.strip(), keys, active)
+        return cls(key, title.strip(), license_text.strip(), keys, active, regions)
 
     def encode(self) -> str:
-        return json.dumps(asdict(self), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        # Omitting an absent allowed_regions keeps legacy source contracts
+        # byte-identical after an upgrade; unrestricted stays unrestricted.
+        value = {key: item for key, item in asdict(self).items() if item is not None}
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -184,11 +218,22 @@ class Registry:
             raise ContractError("unknown_unit", f"no conversion for {indicator.key}: {source_unit}")
         return rule
 
-    def require_scope(self, source: Source, indicator: Indicator) -> None:
+    def require_scope(self, source: Source, indicator: Indicator, region: str = LEGACY_REGION) -> None:
         if not source.active:
             raise ContractError("inactive_source", f"source {source.key} is inactive")
         if indicator.key not in source.allowed_indicators:
             raise ContractError("scope_violation", f"source {source.key} cannot submit {indicator.key}")
+        if source.allowed_regions is not None and region not in source.allowed_regions:
+            raise ContractError("region_scope_violation",
+                                f"source {source.key} is not licensed for region {region}")
+
+    def require_manifest_scope(self, source: Source, region: str = LEGACY_REGION) -> None:
+        """Authority check for the batch-level default region, before any rows."""
+        if not source.active:
+            raise ContractError("inactive_source", f"source {source.key} is inactive")
+        if source.allowed_regions is not None and region not in source.allowed_regions:
+            raise ContractError("region_scope_violation",
+                                f"source {source.key} is not licensed for region {region}")
 
     def list_indicators(self) -> list[Indicator]:
         return [Indicator.from_dict(json.loads(value)) for value in self.store.list_contracts("indicators")]

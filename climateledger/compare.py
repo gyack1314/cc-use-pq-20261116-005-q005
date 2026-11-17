@@ -4,7 +4,7 @@ from dataclasses import dataclass, asdict
 from decimal import Decimal
 from typing import Any
 
-from .registry import ContractError, Registry
+from .registry import ContractError, Registry, region_identifier
 from .normalize import period_index
 
 
@@ -12,6 +12,7 @@ from .normalize import period_index
 class Delta:
     source: str
     indicator: str
+    region: str
     period: str
     old_value: str | None
     new_value: str | None
@@ -23,8 +24,8 @@ class Delta:
         return asdict(self)
 
 
-def entry_key(row: dict[str, Any]) -> tuple[str, str, str]:
-    return row["source"], row["indicator"], row["period"]
+def entry_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    return row["source"], row["indicator"], row["region"], row["period"]
 
 
 def compare_entries(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> list[Delta]:
@@ -54,10 +55,13 @@ def compare_entries(before: list[dict[str, Any]], after: list[dict[str, Any]]) -
 def summarize_changes(changes: list[Delta]) -> dict[str, Any]:
     by_kind = {name: 0 for name in ("added", "removed", "revised", "reaffirmed")}
     by_indicator: dict[str, int] = {}
+    by_region: dict[str, int] = {}
     for change in changes:
         by_kind[change.change] += 1
         by_indicator[change.indicator] = by_indicator.get(change.indicator, 0) + 1
-    return {"count": len(changes), "by_kind": by_kind, "by_indicator": by_indicator}
+        by_region[change.region] = by_region.get(change.region, 0) + 1
+    return {"count": len(changes), "by_kind": by_kind, "by_indicator": by_indicator,
+            "by_region": by_region}
 
 
 class Comparator:
@@ -83,10 +87,10 @@ class Comparator:
         keys = {entry_key(item): item for item in existing}
         touched = []
         for item in self.store.measurements(batch_id):
-            key = batch["source"], item["indicator"], item["period"]
+            key = batch["source"], item["indicator"], item["region"], item["period"]
             previous = keys.get(key)
-            touched.append({"indicator": item["indicator"], "period": item["period"],
-                            "new_value": item["value"],
+            touched.append({"indicator": item["indicator"], "region": item["region"],
+                            "period": item["period"], "new_value": item["value"],
                             "old_value": previous["value"] if previous else None,
                             "effect": "added" if previous is None else (
                                 "revised" if previous["value"] != item["value"] else "reaffirmed")})
@@ -100,11 +104,16 @@ class SeriesWindow:
         self.registry = registry
 
     def slice(self, indicator_key: str, version: int, *, source: str | None = None,
-              start: str | None = None, end: str | None = None) -> list[dict[str, Any]]:
+              region: str | None = None, start: str | None = None,
+              end: str | None = None) -> list[dict[str, Any]]:
         indicator = self.registry.indicator(indicator_key)
         self.store.release(version)
+        if region is not None:
+            region_identifier(region, "region")
         rows = [row for row in self.store.release_entries(version)
-                if row["indicator"] == indicator_key and (source is None or row["source"] == source)]
+                if row["indicator"] == indicator_key and (source is None or row["source"] == source)
+                # A global row is never substituted for a requested province.
+                and (region is None or row["region"] == region)]
         if start is not None:
             start_index = period_index(start, indicator.cadence)
             rows = [row for row in rows if period_index(row["period"], indicator.cadence) >= start_index]
@@ -113,13 +122,15 @@ class SeriesWindow:
             rows = [row for row in rows if period_index(row["period"], indicator.cadence) <= end_index]
         return rows
 
-    def statistics(self, indicator_key: str, version: int, *, source: str | None = None) -> dict[str, Any]:
-        rows = self.slice(indicator_key, version, source=source)
+    def statistics(self, indicator_key: str, version: int, *, source: str | None = None,
+                   region: str | None = None) -> dict[str, Any]:
+        rows = self.slice(indicator_key, version, source=source, region=region)
         values = [Decimal(row["value"]) for row in rows]
         if not values:
             return {"count": 0, "minimum": None, "maximum": None, "mean": None,
-                    "first_period": None, "last_period": None}
+                    "first_period": None, "last_period": None, "regions": []}
         return {"count": len(values), "minimum": str(min(values)), "maximum": str(max(values)),
                 "mean": str(sum(values) / len(values)),
                 "first_period": min(row["period"] for row in rows),
-                "last_period": max(row["period"] for row in rows)}
+                "last_period": max(row["period"] for row in rows),
+                "regions": sorted({row["region"] for row in rows})}

@@ -7,6 +7,15 @@ from .intake import canonical_bytes
 from .registry import ContractError
 
 
+LEGACY_ENTRY_FIELDS = ("source", "indicator", "period", "batch_id", "line", "value", "unit")
+REGION_ENTRY_FIELDS = ("source", "indicator", "region", "period", "batch_id", "line",
+                       "value", "unit")
+
+
+def entry_fields(manifest: dict[str, Any]) -> tuple[str, ...]:
+    return REGION_ENTRY_FIELDS if manifest.get("schema_version", 1) >= 2 else LEGACY_ENTRY_FIELDS
+
+
 class ReleaseBuilder:
     def __init__(self, store):
         self.store = store
@@ -29,27 +38,34 @@ class ReleaseBuilder:
 
     def _entries(self, batch_id: int, prior_version: int | None) -> list[dict[str, Any]]:
         batch = self.store.batch(batch_id)
-        entries: dict[tuple[str, str, str], dict[str, Any]] = {}
+        entries: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+        fields = ("source", "indicator", "region", "period", "batch_id", "line", "value", "unit")
         if prior_version:
             for item in self.store.release_entries(prior_version):
-                key = item["source"], item["indicator"], item["period"]
-                entries[key] = {field: item[field] for field in (
-                    "source", "indicator", "period", "batch_id", "line", "value", "unit")}
+                key = item["source"], item["indicator"], item["region"], item["period"]
+                entries[key] = {field: item[field] for field in fields}
         for item in self.store.measurements(batch_id):
-            key = batch["source"], item["indicator"], item["period"]
+            key = batch["source"], item["indicator"], item["region"], item["period"]
             entries[key] = {"source": batch["source"], "indicator": item["indicator"],
-                            "period": item["period"], "batch_id": batch_id, "line": item["line"],
+                            "region": item["region"], "period": item["period"],
+                            "batch_id": batch_id, "line": item["line"],
                             "value": item["value"], "unit": item["unit"]}
         return [entries[key] for key in sorted(entries)]
 
     def _manifest(self, batch: dict[str, Any], version: int,
                   entries: list[dict[str, Any]], prior: dict[str, Any] | None) -> dict[str, Any]:
         data_hash = sha256(canonical_bytes(entries)).hexdigest()
-        return {"schema_version": 1, "version": version, "parent_digest": prior["digest"] if prior else None,
+        regions = sorted({entry["region"] for entry in entries})
+        return {"schema_version": 2, "version": version,
+                "parent_digest": prior["digest"] if prior else None,
                 "batch": {"id": batch["id"], "source": batch["source"], "external_id": batch["external_id"],
                           "revision": batch["revision"], "payload_hash": batch["payload_hash"],
-                          "row_count": batch["row_count"]},
+                          "row_count": batch["row_count"],
+                          # The batch's region provenance travels with the snapshot.
+                          "region": batch["region"], "region_origin": batch["region_origin"],
+                          "region_detail": batch["region_detail"]},
                 "entry_count": len(entries), "entries_sha256": data_hash,
+                "regions": regions,
                 "quality_findings": batch["findings"]}
 
     def publish(self, batch_id: int, expected_revision: int) -> dict[str, Any]:
@@ -67,17 +83,24 @@ class ReleaseBuilder:
     def export(self, version: int) -> dict[str, Any]:
         release = self.store.release(version)
         entries = self.store.release_entries(version)
-        comparable = [{key: item[key] for key in ("source", "indicator", "period", "batch_id", "line", "value", "unit")}
-                      for item in entries]
+        manifest = release["manifest"]
+        # Historical schema-1 snapshots digest only the original fields; their
+        # stored data is unscoped, and adding region to the digest would
+        # retroactively declare them corrupt.
+        fields = entry_fields(manifest)
+        comparable = [{key: item[key] for key in fields} for item in entries]
         actual = sha256(canonical_bytes(comparable)).hexdigest()
-        if actual != release["manifest"]["entries_sha256"]:
+        if actual != manifest["entries_sha256"]:
             raise ContractError("release_corrupt", "release entries digest differs from manifest")
-        manifest_digest = sha256(canonical_bytes(release["manifest"])).hexdigest()
+        if fields is REGION_ENTRY_FIELDS and (
+                sorted({entry["region"] for entry in comparable}) != manifest.get("regions")):
+            raise ContractError("release_corrupt", "release region inventory differs from manifest")
+        manifest_digest = sha256(canonical_bytes(manifest)).hexdigest()
         if manifest_digest != release["digest"]:
             raise ContractError("release_corrupt", "manifest digest differs from stored digest")
-        if release["manifest"]["entry_count"] != len(entries):
+        if manifest["entry_count"] != len(entries):
             raise ContractError("release_corrupt", "release entry count differs")
-        return {"manifest": release["manifest"], "digest": release["digest"], "entries": comparable}
+        return {"manifest": manifest, "digest": release["digest"], "entries": comparable}
 
     @staticmethod
     def verify(bundle: dict[str, Any]) -> bool:
@@ -88,6 +111,12 @@ class ReleaseBuilder:
         manifest = bundle["manifest"]
         if manifest.get("entry_count") != len(bundle["entries"]):
             return False
+        if entry_fields(manifest) is REGION_ENTRY_FIELDS:
+            # A region-less bundle cannot pass as a region-aware release, and
+            # the declared region inventory must match the entries it ships.
+            regions = {entry.get("region") for entry in bundle["entries"] if isinstance(entry, dict)}
+            if None in regions or sorted(regions) != manifest.get("regions"):
+                return False
         try:
             entries_hash = sha256(canonical_bytes(bundle["entries"])).hexdigest()
             manifest_hash = sha256(canonical_bytes(manifest)).hexdigest()
